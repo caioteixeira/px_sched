@@ -50,7 +50,7 @@ namespace px {
 // Enable if you want the threads to track resource locking, this might slow
 // down things a bit.
 #ifndef PX_SCHED_CHECK_DEADLOCKS
-#define PX_SCHED_CHECK_DEADLOCKS 1 // TODO default value should be 0
+#define PX_SCHED_CHECK_DEADLOCKS 0
 #endif
 
 // -- Backend selection --------------------------------------------------------
@@ -376,25 +376,92 @@ namespace px {
   template<class M>
   class Mutex {
   public:
+
+    ~Mutex() { lock(); }
+
     void lock() {
+      std::thread::id tid = std::this_thread::get_id();
+      if (owner_ == tid) {
+        count_++;
+        return;
+      }
       Scheduler::CurrentThreadBeforeLockResource(&mutex_);
       mutex_.lock();
+      owner_ = tid;
+      count_ = 1;
       Scheduler::CurrentThreadAfterLockResource(true);
     }
     void unlock() {
-      Scheduler::CurrentThreadReleasesResource(&mutex_);
-      mutex_.unlock();
+      std::thread::id tid = std::this_thread::get_id();
+      PX_SCHED_CHECK(owner_ == tid, "Invalid Mutex::unlock owner mistmatch");
+      count_--;
+      if (count_ == 0) {
+        owner_ = std::thread::id();
+        Scheduler::CurrentThreadReleasesResource(&mutex_);
+        mutex_.unlock();
+      }
     }
+
     bool try_lock() {
+      std::thread::id tid = std::this_thread::get_id();
+      if (owner_ == tid) {
+        count_++;
+        return true;
+      }
       Scheduler::CurrentThreadBeforeLockResource(&mutex_);
       bool result = mutex_.try_lock();
+      if (result) {
+        owner_ = tid;
+        count_ = 1;
+      }
       Scheduler::CurrentThreadAfterLockResource(result);
       return result;
     }
   private:
+    std::thread::id owner_ ;
+    uint32_t count_ = 0;
     M mutex_;
   };
 
+  //-- Optional: Spinlock ------------------------------------------------------
+  class Spinlock {
+  public:
+    Spinlock() : owner_(std::thread::id()), count_(0) {}
+
+    ~Spinlock() {
+      lock();
+    }
+
+    void lock() {
+      while(!try_lock()) {}
+    }
+
+    void unlock() {
+      std::thread::id tid = std::this_thread::get_id();
+      PX_SCHED_CHECK(owner_ == tid, "Invalid Spinlock::unlock owner mistmatch");
+      count_--;
+      if (count_ == 0) {
+        owner_ = std::thread::id();
+      }
+    }
+
+    bool try_lock() {
+      std::thread::id tid = std::this_thread::get_id();
+      if (owner_ == tid) {
+        count_++;
+        return true;
+      }
+      std::thread::id expected;
+      if (owner_.compare_exchange_weak(expected, tid)) {
+        count_ = 1;
+        return true;
+      }
+      return false;
+    }
+  private:
+    std::atomic<std::thread::id> owner_ ;
+    uint32_t count_;
+  };
 
   //-- Object pool implementation ----------------------------------------------
   template<class T>
@@ -638,12 +705,12 @@ namespace px {
     if (d->scheduler) {
       d->scheduler->active_threads_.fetch_add(1);
     }
-#if PX_SCHED_CHECK_DEADLOCKS
     if (success && d->next_lock.ptr) {
+#if PX_SCHED_CHECK_DEADLOCKS
       std::lock_guard<std::mutex> l(d->adquired_locks_m);
       d->adquired_locks.push_back(d->next_lock);
-    }
 #endif
+    }
     d->next_lock = {nullptr,nullptr}; // reset
   }
 
@@ -752,9 +819,12 @@ namespace px {
     _ADD("\nWorkers(%d):", params_.num_threads);
     for(size_t i = 0; i < params_.num_threads; ++i) {
       auto &w = workers_[i];
-      std::lock_guard<std::mutex> l(w.thread_tls->adquired_locks_m);
       bool is_on =(w.wake_up.load() == nullptr);
-      bool has_something_to_show = w.thread_tls->next_lock.ptr || w.thread_tls->adquired_locks.size();
+      bool has_something_to_show = w.thread_tls->next_lock.ptr;
+#if PX_SCHED_CHECK_DEADLOCKS
+      std::lock_guard<std::mutex> l(w.thread_tls->adquired_locks_m);
+      has_something_to_show = has_something_to_show || w.thread_tls->adquired_locks.size();
+#endif
       if (!is_on && !has_something_to_show) {
         continue;
       }
@@ -762,6 +832,7 @@ namespace px {
           is_on?"ON":"OFF",
           w.thread_tls->name? w.thread_tls->name: "-no-name-"
           );
+#if PX_SCHED_CHECK_DEADLOCKS
       if (w.thread_tls->adquired_locks.size()) {
         _ADD("\n    AdquiredLocks:");
         for(auto ptr:w.thread_tls->adquired_locks) {
@@ -772,6 +843,7 @@ namespace px {
           }
         }
       }
+#endif
       if (w.thread_tls->next_lock.ptr) {
         if (w.thread_tls->next_lock.name) {
           _ADD("\n    Waiting For Lock: %p(%s)", w.thread_tls->next_lock.ptr, w.thread_tls->next_lock.name);
